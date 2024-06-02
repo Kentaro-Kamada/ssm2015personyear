@@ -1,0 +1,532 @@
+---
+title: "SSM職歴データのパーソンイヤーデータへの変換（R版）"
+author: "鎌田健太郎"
+format: 
+  html:
+    embed-resources: true
+    toc: true
+execute:
+  message: false
+  warning: false
+  cache: true
+knitr:
+  opts_chunk:
+    dev: 'ragg_png'
+---
+
+```{r}
+# ライブラリの読み込み
+library(tidyverse)
+library(haven)
+library(modelsummary)
+
+```
+
+## パーソンイヤーデータの準備（1_expand_data.do）
+
+```{r}
+data <- read_sav("data/SSM2015_v070_20170227.sav", user_na = TRUE)
+
+df1 <- 
+  data |> 
+  mutate(
+    id = row_number(),
+    birthyear = case_when(
+      meibo_1 == 1 ~ meibo_2 + 1925,
+      meibo_1 == 2 ~ meibo_2 + 1988,
+    ),
+    birthmonth = meibo_3,
+    age2014 = 2014 - birthyear,
+    currentage = q1_2_5
+  ) |> 
+  # 15歳から2014年12月31日時点年齢までの期間のperson-year dataを作成
+  mutate(age = map(age2014, \(x) 15:x)) |> 
+  unnest(age) |> 
+  mutate(year = birthyear + age) |> 
+  arrange(id, year)
+
+
+df1 |> 
+  select(id, year, age, age2014, birthyear, birthmonth) |> 
+  filter(birthmonth == 1) 
+
+```
+
+
+## 職歴関連変数の作成（2_1_job_history.do）
+
+
+```{r}
+
+# 職歴関連変数
+occ <- 
+  data |> 
+  mutate(id = row_number()) |> 
+  # 変数名の変更
+  rename(
+    job1 = q8_1,
+    nfirm1 = q8_2,
+    industry1 = q8_b,
+    firmsize1 = q8_c,
+    status1 = q8_a,
+    occupation1 = q8_f,
+    title1 = q8_g,
+    jobst1 = q8_h_1,
+    joben1 = q8_h_2
+  ) |> 
+  rename_with(.fn = \(x) str_replace(x, '^q9_(\\d+)$', 'job\\1')) |> 
+  rename_with(.fn = \(x) str_replace(x, '^q9_(\\d+)_c_1$', 'nfirm\\1')) |> 
+  rename_with(.fn = \(x) str_replace(x, '^q9_(\\d+)_c_2$', 'industry\\1')) |>
+  rename_with(.fn = \(x) str_replace(x, '^q9_(\\d+)_c_3$', 'firmsize\\1')) |>
+  rename_with(.fn = \(x) str_replace(x, '^q9_(\\d+)_c_4$', 'status\\1')) |>
+  rename_with(.fn = \(x) str_replace(x, '^q9_(\\d+)_c_5$', 'occupation\\1')) |>
+  rename_with(.fn = \(x) str_replace(x, '^q9_(\\d+)_c_6$', 'title\\1')) |>
+  rename_with(.fn = \(x) str_replace(x, '^q9_(\\d+)_c_7$', 'jobst\\1')) |>
+  rename_with(.fn = \(x) str_replace(x, '^q9_(\\d+)_c_8$', 'joben\\1')) |> 
+  rename_with(.fn = \(x) str_replace(x, '^q9_(\\d+)_b_1$', 'reason\\1')) |>
+  rename_with(.fn = \(x) str_replace(x, '^q9_(\\d+)_b_1_9$', 'reason_other\\1')) |> 
+  select(id, matches('job|nfirm|industry|firmsize|status|occupation|title|jobst|joben|reason|reason_other')) |> 
+  # 1-22をロング形式にまとめる
+  pivot_longer(
+    cols = matches('job|nfirm|industry|firmsize|status|occupation|title|jobst|joben|reason|reason_other'),
+    names_to = c('.value', 'jobnum_'),
+    names_pattern = '(.+?)(\\d+)$'
+  ) |> 
+  mutate(age = jobst)
+  
+
+df2_1 <-
+  df1 |> 
+  # expandしたデータに職歴の情報をくっつける
+  left_join(occ, by = join_by(id, age)) |> 
+  # idごとに次のnumまでのNAを埋める
+  group_by(id) |> 
+  fill(
+    jobnum_, matches('job|nfirm|industry|firmsize|status|occupation|title|jobst|joben|reason|reason_other'),
+    .direction = 'down'
+  ) |> 
+  ungroup() |> 
+  # 就業状態を表す変数（work）を作成
+  mutate(
+    work = case_when(
+      is.na(jobst) ~ 0,
+      nfirm > 0 ~ 1,
+      nfirm == 0 ~ 0,
+      .default = NA
+    )
+  )
+
+```
+
+
+## 学校関連変数の作成（2_2_school_history.do）
+
+
+```{r}
+
+# 教育歴関連情報
+school <- 
+  data |> 
+  mutate(id = row_number()) |> 
+  rename_with(.fn = \(x) str_replace(x, '^q20_(\\d)$', 'school\\1')) |>
+  rename_with(.fn = \(x) str_replace(x, '^q20_(\\d)_b_1$', 'age_school\\1')) |>
+  rename_with(.fn = \(x) str_replace(x, '^q20_(\\d)_b_2$', 'duration_school\\1')) |>
+  rename_with(.fn = \(x) str_replace(x, '^q20_(\\d)_a$', 'school_grad\\1')) |> 
+  select(id, matches('school|age_school|duration_school|school_grad')) |> 
+  pivot_longer(
+    cols = matches('school|age_school|duration_school|school_grad'), 
+    names_to = c('.value', 'schoolnum_'), 
+    names_pattern = '(.+?)(\\d)$'
+  ) |> 
+  mutate(
+    schoolst = case_when(
+      school < 88 & age_school != 999 ~ age_school,
+      .default = NA
+    ),
+    schoolen = case_when(
+      school < 88 & age_school != 999 ~ age_school + duration_school,
+    ),
+  )
+
+df2_2 <-
+  df2_1 |> 
+  # 教育歴の情報をくっつける
+  left_join(school, by = join_by(id, between(age, schoolst, schoolen, bounds = '[)'))) |> 
+  mutate(
+    school_enrolled = case_when(
+      # 高校に通ったことがある場合は15~17歳の期間を学生とみなす（中退した場合の中退年齢が不明のため卒業者と同様に扱う）
+      q18_5 == 1 & between(age, 15, 17) ~ 1,
+      # i番目の学校に通っていた期間を学生期間とみなす
+      between(age, schoolst, schoolen - 1) ~ 1,
+      .default = 0
+    )
+  )
+
+df2_2 |> 
+  select(id, age, school_enrolled, schoolnum_, schoolst, schoolen) |> 
+  filter(school_enrolled == 1) 
+
+```
+
+
+
+## 婚姻状態関連変数の作成（2_3_marriage_history.do）
+
+
+
+```{r}
+
+df2_3 <- 
+  df2_2 |> 
+  mutate(
+    # 初婚年齢
+    age_firstmarriage = case_when(
+      q25 == 2 & q33 == 1 ~ q26, # 現在結婚していて、初婚
+      q33 == 2 & sq1 != 99 ~ sq1, # 現在結婚していて、再婚
+      q25 == 3 | q25 == 4 ~ q34, # 現在離別または死別
+      q25 == 1 ~ 98, # 現在未婚
+      .default = NA
+    ),
+    # 直近の結婚年齢（2回以上結婚した人のみ）
+    age_recentmarriage = case_when(
+      q25 == 2 & q33 == 1 ~ 98, # 現在結婚していて、初婚
+      q25 == 2 & q33 == 2 & q26 != 999 ~ q26, # 現在結婚していて、再婚
+      q25 == 1 ~ 98, # 現在未婚
+      q25 == 3 ~ 98, # 現在離別
+      q25 == 4 ~ 98, # 現在死別
+      .default = NA
+    ),
+    # 離別年齢
+    age_divorce = case_when(
+      q25 == 2 & q33 == 1 ~ 98, # 現在結婚していて、初婚
+      sq2_1 != 88 & sq2_1 != 999 & q25 == 2 & q33 == 2 ~ sq2_1, # 現在結婚していて、再婚
+      sq2_1 == 88 & q25 == 2 & q33 == 2 ~ 98, # 現在結婚していて、再婚
+      q25 == 1 ~ 98, # 現在未婚
+      q41 != 99 & q41 != 999 & q25 == 3 ~ q41, # 現在離別
+      q25 == 4 ~ 98, # 現在死別,
+      .default = NA
+    ),
+    # 死別年齢
+    age_separate = case_when(
+      q25 == 2 & q33 == 1 ~ 98, # 現在結婚していて、初婚
+      sq2_2 != 88 & sq2_2 != 999 & q25 == 2 & q33 == 2 ~ sq2_2, # 現在結婚していて、再婚
+      sq2_2 == 88 & q25 == 2 & q33 == 2 ~ 98, # 現在結婚していて、再婚
+      q25 == 1 ~ 98, # 現在未婚
+      q25 == 3 ~ 98, # 現在離別
+      q41 != 99 & q41 != 999 & q25 == 4 ~ q41, # 現在死別
+      .default = NA
+    ),
+  ) |> 
+  # 婚姻状態（時変）
+  mutate(
+    marstat = case_when(
+      age < age_firstmarriage & age < age_recentmarriage & age < age_divorce & age < age_separate ~ 1,
+      age >= age_firstmarriage & age < age_recentmarriage & age < age_divorce & age < age_separate ~ 2,
+      age >= age_firstmarriage & age >= age_recentmarriage & age >= age_divorce ~ 3,
+      age >= age_firstmarriage & age >= age_recentmarriage & age >= age_separate ~ 3,
+      age >= age_firstmarriage & age < age_recentmarriage & age >= age_divorce & age < age_separate ~ 4,
+      age >= age_firstmarriage & age < age_recentmarriage & age < age_divorce & age >= age_separate ~ 5,
+      .default = NA
+    ) |> 
+      labelled(
+        labels = c(
+          "未婚" = 1,
+          "初婚" = 2,
+          "再婚" = 3,
+          "離別" = 4,
+          "死別" = 5
+        ),
+        label = '婚姻状態（時変）'
+      )
+  )
+
+df2_3 |>
+  select(id, age, age_firstmarriage, age_recentmarriage, age_divorce, age_separate, marstat)
+
+```
+
+
+## 子ども関連変数の作成（2_4_child_history.do）
+
+
+```{r}
+
+df2_4 <- 
+  df2_3 |> 
+  # 子ども1-4をまとめて処理
+  pivot_longer(
+    cols = matches('dq13_\\d+_2[ab]'), 
+    names_to = c('childnum_','.value'), 
+    names_pattern = 'dq13_(\\d+)_2([ab])',
+  ) |> 
+  mutate(
+    # 第i子が生まれた年（実子・養子区別なし）
+    birthyear_child = case_when(
+      a == 1 & b != 88 & b != 99 ~ b + 1925,
+      a == 2 & b != 88 & b != 99 ~ b + 1988,
+      a == 8 ~ 8888,
+      a == 9 ~ 9999,
+      .default = NA
+    )
+  ) |> 
+  select(!c(a, b)) |> 
+  mutate(
+    # 第i子が生まれたときの回答者の年齢（実子・養子区別なし）
+    age_birth = case_when(
+      birthyear_child != 8888 & birthyear_child != 9999 ~ birthyear_child - birthyear - 1,
+      birthyear_child == 8888 ~ 8888,
+      .default = NA
+    ),
+    # 第i子の年齢（実子・養子区別なし）
+    age_child = case_when(
+      year >= birthyear_child ~ year - birthyear_child,
+      .default = NA
+    )
+  ) |> 
+  # 横持ちにもどす
+  pivot_wider(
+    names_from = childnum_, 
+    values_from = c(birthyear_child, age_birth, age_child),
+    names_glue = '{.value}{childnum_}'
+  ) |> 
+  mutate(
+    # 子どもの人数（時変、実子・養子区別なし、最大4人）
+    number_child = case_when(
+      !is.na(birthyear_child1) & year <= birthyear_child1 ~ 0,
+      !is.na(birthyear_child1) & year >= birthyear_child1 & year < birthyear_child2 ~ 1,
+      !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year < birthyear_child3 ~ 2,
+      !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year >= birthyear_child3 & year < birthyear_child4 ~ 3,
+      !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year >= birthyear_child3 & year >= birthyear_child4 ~ 4,
+      .default = NA
+    ) |> 
+      labelled(
+        labels = c(
+          "0人" = 0,
+          "1人" = 1,
+          "2人" = 2,
+          "3人" = 3,
+          "4人以上" = 4
+        ),
+        label = '子ども人数（時変）'
+      ),
+    # 末子年齢（時変、実子・養子区別なし、5人以上子どもがいる場合でも末子は4番目になる点に注意）
+    age_lchild = case_when(
+      !is.na(birthyear_child1) & year >= birthyear_child1 & year < birthyear_child2 ~ age_child1,
+      !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year < birthyear_child3 ~ age_child2,
+      !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year >= birthyear_child3 & year < birthyear_child4 ~ age_child3,
+      !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year >= birthyear_child3 & year >= birthyear_child4 ~ age_child4,
+      .default = NA
+    ) |> 
+      labelled(label = '末子年齢')
+  )
+
+df2_4 |>
+  select(id, year, birthyear_child1, birthyear_child2, birthyear_child3, age_child1, age_child2, age_child3, number_child)
+
+```
+
+
+## 保存
+
+```{r}
+
+write_dta(df2_4, path = 'data/ssm2015personyear_r.dta')
+
+```
+
+
+## データの構造（3_1_scatter.do）
+
+調査年および年齢のレキシス図を書いてみる
+
+```{r}
+#| include: false
+
+# オブジェクトをクリア
+rm(list = ls())
+gc()
+
+# データ読み込み
+data <- read_dta('data/ssm2015personyear_r.dta')
+```
+
+
+
+```{r}
+
+data |> 
+  count(age, year) |> 
+  ggplot(aes(year, age, size = n)) +
+  geom_point(shape = 1, color = 'blue')+
+  scale_x_continuous(breaks = seq(1950, 2020, 10))+
+  scale_y_continuous(breaks = seq(10, 80, 10))+
+  theme_bw()+
+  theme(legend.position = 'none')
+
+```
+
+
+## 従業上の地位による初婚への意向の違いに関するイベントヒストリー分析
+
+18-49歳、1945-1984年生まれコホートの男女を分析対象として、従業上の地位と初婚への移行の関連をみる
+
+```{r}
+
+df3_2 <- 
+  data |> 
+  mutate(
+    sex = as_factor(q1_1) |> fct_recode(Men = '男性', Women = '女性'),
+    firstmarriage = case_when(
+      age < age_firstmarriage ~ 0,
+      age == age_firstmarriage ~ 1,
+      .default = NA
+    ),
+    cohort = case_when(
+      birthyear >= 1945 & birthyear < 1955 ~ '1945-54',
+      birthyear >= 1955 & birthyear < 1965 ~ '1955-64',
+      birthyear >= 1965 & birthyear < 1975 ~ '1965-74',
+      birthyear >= 1975 & birthyear < 1985 ~ '1975-84',
+      .default = NA
+    ) |> 
+      fct_relevel('1945-54', '1955-64', '1965-74', '1975-84'),
+    employmentstatus = case_when(
+      status == 1 | status == 2 ~ 'Regular employment',
+      status == 3 | status == 4 | status == 5 | status == 6 ~ 'Non-regular employment',
+      status == 7 | status == 8 | status == 9 ~ 'Self-employment',
+      work == 0 ~ 'Non-employment',
+      school_enrolled == 1 ~ 'School enrollment',
+      .default = NA
+    ) |> 
+      fct_relevel('Regular employment', 'Non-regular employment', 'Self-employment', 'Non-employment', 'School enrollment'),
+  ) |> 
+  mutate(employmentstatus_lag = lag(employmentstatus), .by = id) |> 
+  filter(between(age, 18, 49)) |> 
+  filter(age_firstmarriage >= 18) |> 
+  drop_na(firstmarriage, cohort)
+
+```
+
+
+### Kaplan-Meier survival estimates
+
+```{r}
+
+survival::survfit(survival::Surv(age, firstmarriage) ~ sex, data = df3_2) |> 
+  survminer::ggsurvplot(
+    xlab = 'Age',
+    ylab = 'Survival rate',
+  )
+  
+```
+
+
+### Logit model
+
+```{r}
+
+logit_result <- 
+  df3_2 |> 
+  group_nest(sex) |> 
+  mutate(
+    model1 = map(
+      data, \(data) 
+      glm(firstmarriage ~ employmentstatus + age + I(age^2) + I(age^3) + cohort, data = data, family = binomial)
+    ),
+    model2 = map(
+      data, \(data) 
+      glm(
+        firstmarriage ~ employmentstatus + age + I(age^2) + I(age^3) + cohort + employmentstatus_lag, 
+        data = data, family = binomial
+      )
+    )
+  ) |> 
+  select(!data) |> 
+  pivot_longer(cols = starts_with('model'), names_to = 'model', values_to = 'object') |> 
+  mutate(object = set_names(object, str_c(model, ', ', sex))) 
+
+
+modelsummary(logit_result$object, stars = TRUE)
+
+```
+
+
+## 第一子出産が就業率に与える効果に関する固定効果モデル
+
+1945-1984年出生、15-59歳、学生でない男女のうち、
+
+- 調査時点で子どもがいない人については全員
+- 第一子出産を経験した人については、出産4年前から
+
+を分析対象として、第一子出産が就業率をどの程度変化させるかをみる
+
+
+```{r}
+
+df3_3 <- 
+  data |> 
+  mutate(
+    sex = as_factor(q1_1) |> fct_recode(Men = '男性', Women = '女性'),
+    time_from_birth = case_when(
+      age - age_birth1 < -4 ~ NA, # 第1子を出産した人の、出産の5年以上前のperson-yearは欠損とする
+      age_birth1 == 8888 ~ -3, # 第1子を出産していない個人をrefに含める（3年前とする）
+      age - age_birth1 > 20 & !is.na(age - age_birth1) ~ 20, # 第一子出産から20年以上経過した場合をまとめる
+      age_birth1 != 8888 ~ age - age_birth1,
+      .default = NA
+    ) |> 
+      factor() |> 
+      fct_recode(`-3 (ref.)` = '-3', `20 or later` = '20'),
+  ) |> 
+  filter(between(birthyear, 1945, 1984)) |>
+  filter(between(age, 15, 59)) |>
+  filter(school_enrolled == 0) |>
+  drop_na(time_from_birth, work)
+  
+```
+
+
+```{r}
+
+gtsummary::tbl_cross(
+  time_from_birth, work,
+  data = df3_3 |> filter(sex == 'Men'),
+  statistic = '{p}',
+  digits = 1,
+  percent = 'row'
+)
+
+gtsummary::tbl_cross(
+  time_from_birth, work,
+  data = df3_3 |> filter(sex == 'Women'),
+  statistic = '{p}',
+  digits = 1,
+  percent = 'row'
+)
+
+```
+
+
+## Fixed effect model
+
+```{r}
+
+fe_result <-
+  df3_3 |> 
+  mutate(time_from_birth = fct_relevel(time_from_birth, '-3 (ref.)')) |>
+  group_nest(sex) |> 
+  mutate(
+    model = map(
+      data, \(data) 
+      fixest::feols(
+        work ~ time_from_birth + I(age^2) | id + year, 
+        data = data, 
+        cluster = ~id
+      )
+    )
+  ) |> 
+  select(!data) |>
+  mutate(model = set_names(model, sex))
+
+modelsummary(fe_result$model, stars = TRUE)
+
+```
+
