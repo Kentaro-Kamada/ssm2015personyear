@@ -15,6 +15,7 @@ knitr:
 ---
 
 ```{r}
+
 # ライブラリの読み込み
 library(tidyverse)
 library(haven)
@@ -44,11 +45,6 @@ df1 <-
   unnest(age) |> 
   mutate(year = birthyear + age) |> 
   arrange(id, year)
-
-
-df1 |> 
-  select(id, year, age, age2014, birthyear, birthmonth) |> 
-  filter(birthmonth == 1) 
 
 ```
 
@@ -90,22 +86,17 @@ occ <-
   pivot_longer(
     cols = matches('job|nfirm|industry|firmsize|status|occupation|title|jobst|joben|reason|reason_other'),
     names_to = c('.value', 'jobnum_'),
-    names_pattern = '(.+?)(\\d+)$'
-  ) |> 
-  mutate(age = jobst)
-  
+    names_pattern = '(.+?)(\\d+)$',
+    names_transform = list(jobnum_ = as.integer)
+  )
+
 
 df2_1 <-
   df1 |> 
-  # expandしたデータに職歴の情報をくっつける
-  left_join(occ, by = join_by(id, age)) |> 
-  # idごとに次のnumまでのNAを埋める
-  group_by(id) |> 
-  fill(
-    jobnum_, matches('job|nfirm|industry|firmsize|status|occupation|title|jobst|joben|reason|reason_other'),
-    .direction = 'down'
-  ) |> 
-  ungroup() |> 
+  # 職歴情報を結合（jobenの情報は利用していない）
+  left_join(occ, by = join_by(id, age >= jobst)) |>
+  # 重複分を削除（id x ageの中で最後の職歴頁jobnum_を採用）
+  filter(jobnum_ == max(jobnum_) | is.na(jobnum_), .by = c(id, age)) |> 
   # 就業状態を表す変数（work）を作成
   mutate(
     work = case_when(
@@ -115,6 +106,10 @@ df2_1 <-
       .default = NA
     )
   )
+  
+# オブジェクト削除
+rm(list = c('occ', 'df1'))
+gc()
 
 ```
 
@@ -136,7 +131,8 @@ school <-
   pivot_longer(
     cols = matches('school|age_school|duration_school|school_grad'), 
     names_to = c('.value', 'schoolnum_'), 
-    names_pattern = '(.+?)(\\d)$'
+    names_pattern = '(.+?)(\\d)$',
+    names_transform = list(schoolnum_ = as.integer)
   ) |> 
   mutate(
     schoolst = case_when(
@@ -151,6 +147,7 @@ school <-
 df2_2 <-
   df2_1 |> 
   # 教育歴の情報をくっつける
+  # schoolst <= age < schoolenのときに、教育歴の情報をマージする
   left_join(school, by = join_by(id, between(age, schoolst, schoolen, bounds = '[)'))) |> 
   mutate(
     school_enrolled = case_when(
@@ -160,11 +157,14 @@ df2_2 <-
       between(age, schoolst, schoolen - 1) ~ 1,
       .default = 0
     )
-  )
+  ) |> 
+  # 開始年齢が同一の教育歴が複数ある場合は、最後のものを残す
+  filter(schoolnum_ == max(schoolnum_) | is.na(schoolnum_), .by = c(id, age))
 
-df2_2 |> 
-  select(id, age, school_enrolled, schoolnum_, schoolst, schoolen) |> 
-  filter(school_enrolled == 1) 
+# オブジェクト削除
+rm(list = c('school', 'df2_1'))
+gc()
+
 
 ```
 
@@ -181,58 +181,67 @@ df2_3 <-
   mutate(
     # 初婚年齢
     age_firstmarriage = case_when(
-      q25 == 2 & q33 == 1 ~ q26, # 現在結婚していて、初婚
-      q33 == 2 & sq1 != 99 ~ sq1, # 現在結婚していて、再婚
-      q25 == 3 | q25 == 4 ~ q34, # 現在離別または死別
       q25 == 1 ~ 98, # 現在未婚
+      q25 == 3 | q25 == 4 ~ q34, # 現在離別または死別
+      q33 == 2 & sq1 != 99 ~ sq1, # 現在結婚していて、再婚
+      q25 == 2 & q33 == 1 ~ q26, # 現在結婚していて、初婚
       .default = NA
-    ),
+    )
+  ) |>
+  mutate(
+    age_firstmarriage = case_when(
+      age_firstmarriage == 99 | age_firstmarriage == 999 ~ NA, # 婚姻状態無回答
+      .default = age_firstmarriage
+    ) |> 
+      labelled(label = '初婚年齢'),
     # 直近の結婚年齢（2回以上結婚した人のみ）
     age_recentmarriage = case_when(
-      q25 == 2 & q33 == 1 ~ 98, # 現在結婚していて、初婚
-      q25 == 2 & q33 == 2 & q26 != 999 ~ q26, # 現在結婚していて、再婚
-      q25 == 1 ~ 98, # 現在未婚
-      q25 == 3 ~ 98, # 現在離別
       q25 == 4 ~ 98, # 現在死別
+      q25 == 3 ~ 98, # 現在離別
+      q25 == 1 ~ 98, # 現在未婚
+      q25 == 2 & q33 == 2 & q26 != 999 ~ q26, # 現在結婚していて、再婚
+      q25 == 2 & q33 == 1 ~ 98, # 現在結婚していて、初婚
       .default = NA
-    ),
+    ) |> 
+      labelled(label = '直近の結婚年齢（2回以上結婚した人のみ）'),
     # 離別年齢
     age_divorce = case_when(
-      q25 == 2 & q33 == 1 ~ 98, # 現在結婚していて、初婚
-      sq2_1 != 88 & sq2_1 != 999 & q25 == 2 & q33 == 2 ~ sq2_1, # 現在結婚していて、再婚
-      sq2_1 == 88 & q25 == 2 & q33 == 2 ~ 98, # 現在結婚していて、再婚
-      q25 == 1 ~ 98, # 現在未婚
-      q41 != 99 & q41 != 999 & q25 == 3 ~ q41, # 現在離別
       q25 == 4 ~ 98, # 現在死別,
+      q41 != 99 & q41 != 999 & q25 == 3 ~ q41, # 現在離別
+      q25 == 1 ~ 98, # 現在未婚
+      sq2_1 == 88 & q25 == 2 & q33 == 2 ~ 98, # 現在結婚していて、再婚
+      sq2_1 != 88 & sq2_1 != 999 & q25 == 2 & q33 == 2 ~ sq2_1, # 現在結婚していて、再婚
+      q25 == 2 & q33 == 1 ~ 98, # 現在結婚していて、初婚
       .default = NA
     ),
     # 死別年齢
     age_separate = case_when(
-      q25 == 2 & q33 == 1 ~ 98, # 現在結婚していて、初婚
-      sq2_2 != 88 & sq2_2 != 999 & q25 == 2 & q33 == 2 ~ sq2_2, # 現在結婚していて、再婚
-      sq2_2 == 88 & q25 == 2 & q33 == 2 ~ 98, # 現在結婚していて、再婚
-      q25 == 1 ~ 98, # 現在未婚
-      q25 == 3 ~ 98, # 現在離別
       q41 != 99 & q41 != 999 & q25 == 4 ~ q41, # 現在死別
+      q25 == 3 ~ 98, # 現在離別
+      q25 == 1 ~ 98, # 現在未婚
+      sq2_2 == 88 & q25 == 2 & q33 == 2 ~ 98, # 現在結婚していて、再婚
+      sq2_2 != 88 & sq2_2 != 999 & q25 == 2 & q33 == 2 ~ sq2_2, # 現在結婚していて、再婚
+      q25 == 2 & q33 == 1 ~ 98, # 現在結婚していて、初婚
       .default = NA
     ),
   ) |> 
   # 婚姻状態（時変）
+  # Note: 各年齢がNAのときの取り扱いがよくわかっていない
   mutate(
     marstat = case_when(
-      age < age_firstmarriage & age < age_recentmarriage & age < age_divorce & age < age_separate ~ 1,
-      age >= age_firstmarriage & age < age_recentmarriage & age < age_divorce & age < age_separate ~ 2,
-      age >= age_firstmarriage & age >= age_recentmarriage & age >= age_divorce ~ 3,
-      age >= age_firstmarriage & age >= age_recentmarriage & age >= age_separate ~ 3,
-      age >= age_firstmarriage & age < age_recentmarriage & age >= age_divorce & age < age_separate ~ 4,
       age >= age_firstmarriage & age < age_recentmarriage & age < age_divorce & age >= age_separate ~ 5,
+      age >= age_firstmarriage & age < age_recentmarriage & age >= age_divorce & age < age_separate ~ 4,
+      age >= age_firstmarriage & age >= age_recentmarriage & age >= age_separate ~ 3,
+      age >= age_firstmarriage & age >= age_recentmarriage & age >= age_divorce ~ 3,
+      age >= age_firstmarriage & age < age_recentmarriage & age < age_divorce & age < age_separate ~ 2,
+      age < age_firstmarriage & age < age_recentmarriage & age < age_divorce & age < age_separate ~ 1,
       .default = NA
     ) |> 
       labelled(
         labels = c(
           "未婚" = 1,
-          "初婚" = 2,
-          "再婚" = 3,
+          "既婚（初婚）" = 2,
+          "既婚（再婚）" = 3,
           "離別" = 4,
           "死別" = 5
         ),
@@ -240,8 +249,20 @@ df2_3 <-
       )
   )
 
-df2_3 |>
-  select(id, age, age_firstmarriage, age_recentmarriage, age_divorce, age_separate, marstat)
+# オブジェクト削除
+rm(list = c('df2_2'))
+gc()
+
+# inner_join(
+#   df2_4 |> 
+#     select(id, age, age_firstmarriage:age_separate, marstat),
+#   data2 |> 
+#     select(id, age, age_firstmarriage:age_separate, marstat),
+#   by = join_by(id, age, age_firstmarriage, age_recentmarriage, age_divorce, age_separate)
+# ) |> 
+#   filter(marstat.x != marstat.y | is.na(marstat.x) != is.na(marstat.y)) |> 
+#   print(n = 1000)
+  
 
 ```
 
@@ -258,14 +279,15 @@ df2_4 <-
     cols = matches('dq13_\\d+_2[ab]'), 
     names_to = c('childnum_','.value'), 
     names_pattern = 'dq13_(\\d+)_2([ab])',
+    names_transform = list(childnum_ = as.integer)
   ) |> 
   mutate(
     # 第i子が生まれた年（実子・養子区別なし）
     birthyear_child = case_when(
-      a == 1 & b != 88 & b != 99 ~ b + 1925,
-      a == 2 & b != 88 & b != 99 ~ b + 1988,
-      a == 8 ~ 8888,
       a == 9 ~ 9999,
+      a == 8 ~ 8888,
+      a == 2 & b != 88 & b != 99 ~ b + 1988,
+      a == 1 & b != 88 & b != 99 ~ b + 1925,
       .default = NA
     )
   ) |> 
@@ -273,8 +295,8 @@ df2_4 <-
   mutate(
     # 第i子が生まれたときの回答者の年齢（実子・養子区別なし）
     age_birth = case_when(
-      birthyear_child != 8888 & birthyear_child != 9999 ~ birthyear_child - birthyear - 1,
       birthyear_child == 8888 ~ 8888,
+      birthyear_child != 8888 & birthyear_child != 9999 ~ birthyear_child - birthyear - 1,
       .default = NA
     ),
     # 第i子の年齢（実子・養子区別なし）
@@ -292,11 +314,11 @@ df2_4 <-
   mutate(
     # 子どもの人数（時変、実子・養子区別なし、最大4人）
     number_child = case_when(
-      !is.na(birthyear_child1) & year <= birthyear_child1 ~ 0,
-      !is.na(birthyear_child1) & year >= birthyear_child1 & year < birthyear_child2 ~ 1,
-      !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year < birthyear_child3 ~ 2,
-      !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year >= birthyear_child3 & year < birthyear_child4 ~ 3,
       !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year >= birthyear_child3 & year >= birthyear_child4 ~ 4,
+      !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year >= birthyear_child3 & year < birthyear_child4 ~ 3,
+      !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year < birthyear_child3 ~ 2,
+      !is.na(birthyear_child1) & year >= birthyear_child1 & year < birthyear_child2 ~ 1,
+      !is.na(birthyear_child1) & year <= birthyear_child1 ~ 0,
       .default = NA
     ) |> 
       labelled(
@@ -311,17 +333,19 @@ df2_4 <-
       ),
     # 末子年齢（時変、実子・養子区別なし、5人以上子どもがいる場合でも末子は4番目になる点に注意）
     age_lchild = case_when(
-      !is.na(birthyear_child1) & year >= birthyear_child1 & year < birthyear_child2 ~ age_child1,
-      !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year < birthyear_child3 ~ age_child2,
-      !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year >= birthyear_child3 & year < birthyear_child4 ~ age_child3,
       !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year >= birthyear_child3 & year >= birthyear_child4 ~ age_child4,
+      !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year >= birthyear_child3 & year < birthyear_child4 ~ age_child3,
+      !is.na(birthyear_child1) & year >= birthyear_child1 & year >= birthyear_child2 & year < birthyear_child3 ~ age_child2,
+      !is.na(birthyear_child1) & year >= birthyear_child1 & year < birthyear_child2 ~ age_child1,
       .default = NA
     ) |> 
       labelled(label = '末子年齢')
   )
 
-df2_4 |>
-  select(id, year, birthyear_child1, birthyear_child2, birthyear_child3, age_child1, age_child2, age_child3, number_child)
+# オブジェクト削除
+rm(list = c('df2_3'))
+gc()
+
 
 ```
 
@@ -348,6 +372,7 @@ gc()
 
 # データ読み込み
 data <- read_dta('data/ssm2015personyear_r.dta')
+
 ```
 
 
@@ -366,7 +391,7 @@ data |>
 ```
 
 
-## 従業上の地位による初婚への意向の違いに関するイベントヒストリー分析
+## 従業上の地位による初婚への移行の違いに関するイベントヒストリー分析
 
 18-49歳、1945-1984年生まれコホートの男女を分析対象として、従業上の地位と初婚への移行の関連をみる
 
